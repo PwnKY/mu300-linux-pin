@@ -1,0 +1,70 @@
+#!/bin/sh
+# Vendor drivers Android loads that the initramfs does not: thermal throttling, status LEDs, SAR power
+# backoff, SIM tray detection, vibrator, DDR/CP DVFS and the Mali GPU (/dev/mali0). Loaded one by one; a failure is logged, not fatal.
+# On the mainline kernel the modem stack is not in the boot image at all: the SIPA accelerator attaches to the
+# USB gadget's usb0 as it is created, and a gadget created while those modules are already loaded transmits
+# nothing the host ever sees. So they are loaded here, once userspace is up and the gadget is long since bound.
+# sipa-dele is deliberately not in that list: it has to come after the modem, not with it (see below).
+M=/lib/modules/$(uname -r)
+if [ -f "$M/sipc-core.ko" ] && ! [ -e /dev/modem ]; then
+    for m in sprd_systimer sprd_time_sync sprd_time_sync_cp trusty trusty-pm trusty-log trusty-irq trusty-ipc \
+             trusty-virtio sprd_shm unisoc-mailbox sprd-sipc-virt-bus sprd_power_manager sipc-core spipe spool \
+             sipx seth slog_bridge sbuf_bridge sblock_bridge sprd_modem_loader sipa-sys sipa-core sipa_eth \
+             sprdbt_tty; do
+        for f in "$M/$m.ko" "$M/$(echo "$m" | tr '_' '-').ko"; do
+            [ -f "$f" ] || continue
+            insmod "$f" 2>/dev/null && echo "loaded $m" || echo "FAILED $m"
+            break
+        done
+    done
+fi
+
+# The IPA delegate answers the modem when it asks permission to send downlink, and it only gets one attempt at
+# opening its SIPC channel - inserted before the modem is up, its thread dies or waits for ever, and the module
+# is [permanent] so it cannot be reloaded. sipa-dele-start waits for the modem first; in the background, since
+# that takes about a minute and everything below it here (Wi-Fi, the GPU, the sound card) must not wait for the
+# modem to finish booting. See that script and docs/FINDINGS.md 13f.
+# Both places: OpenWrt keeps the modules flat in $M, the Ubuntu image under $M/extra. Looking only in $M meant
+# the delegate was never started on Ubuntu, and Ubuntu had no mobile data downlink at all.
+if { [ -f "$M/sipa-dele.ko" ] || [ -f "$M/extra/sipa-dele.ko" ]; } && ! grep -q '^sipa_dele ' /proc/modules; then
+    if [ -f /etc/openwrt_release ]; then
+        # mobile-data inserts it synchronously after registration and before
+        # CGACT. A background loader can race PDP activation and panic inside
+        # the delegate probe when SIPA resources are already active.
+        :
+    else
+        /opt/mu300/bin/sipa-dele-start >/tmp/mu300-sipa-dele.log 2>&1 &
+    fi
+fi
+
+# The PM co-processor keeps its own watchdog, and it power-cuts the device a few minutes after boot unless this
+# driver tells pm_sys to stop it (docs/FINDINGS.md 5). The 5.4 boot image has always loaded it; mainline boot
+# images built before it was ported do not, so load it here too.
+if [ -f "$M/sprd_pmic_wdt.ko" ] && ! grep -q '^sprd_pmic_wdt ' /proc/modules; then
+    insmod "$M/sprd_pmic_wdt.ko" 2>/dev/null && echo "loaded sprd_pmic_wdt" || echo "FAILED sprd_pmic_wdt"
+fi
+
+for m in sprd_soc_thm thermal-generic-adc sprd_cpu_cooling leds-sc27xx-bltc zte_sar zte_card_holder_det sc27xx-vibra sprd_cp_dvfs sprd_ddr_dvfs sprd_gpu_cooling mali_kbase; do
+    if modprobe "$m" 2>/tmp/mu300-modprobe.err; then
+        echo "loaded $m"
+    else
+        echo "FAILED $m: $(cat /tmp/mu300-modprobe.err)"
+    fi
+done
+# The virtual sound card: the board has no speaker path, so software that wants an ALSA device (a SIP gateway
+# on the device, for one) gets a playback/capture pair wired back to back instead - write to hw:0,0 and read it
+# back on hw:0,1. Harmless when nothing opens it. modprobe only finds it once depmod has indexed the module, so
+# fall back to insmod from the directory the rootfs build puts it in.
+if ! grep -q '^snd_aloop ' /proc/modules; then
+    if modprobe snd-aloop 2>/dev/null; then
+        echo "loaded snd-aloop"
+    else
+        for f in "$M/extra/snd-aloop.ko" "$M/snd-aloop.ko"; do
+            [ -f "$f" ] || continue
+            insmod "$f" 2>/dev/null && echo "loaded snd-aloop" || echo "FAILED snd-aloop"
+            break
+        done
+    fi
+fi
+
+true

@@ -1,0 +1,720 @@
+#!/bin/bash
+# Mobile data on the MU300 modem without Android RIL: AT commands on /dev/stty_nr1, data over sipa_eth<cid-1>.
+# usage: mobile-data up [APN] | radio-on | down | status | signal | at "CMD" | sim-reset | watch
+# MU300_NETIFD=1 mobile-data up [APN]: only attach and print IFACE/IP/PREFIX/DNS1/DNS2 (OpenWrt netifd protocol)
+# OpenWrt: od/timeout come from the static busybox in /opt/mu300/busybox-bin
+export PATH="$PATH:/opt/mu300/busybox-bin"
+set -euo pipefail
+DEV=${MU300_AT_DEV:-/dev/stty_nr1}
+CID=1
+IFACE=sipa_eth$((CID - 1))
+DEVICE=$(/opt/mu300/bin/mu300-device 2>/dev/null || echo f50)
+
+# The blue LED only reports whether data is up. The PMIC rejects a brightness write now and then (seen as
+# "write error: Invalid argument"), and under `set -e` that killed up() one line before it could report the
+# connection it had just established - so the call was live while the caller saw a failure. Cosmetic writes
+# must never decide that.
+# led on|5g|off|error: see mu300-led (which LED that is depends on the device)
+led() { /opt/mu300/bin/mu300-led data "$1" 2>/dev/null || true; }
+# data is up: the LED tells 4G from 5G as ZTE's firmware does (the U30 Air: blue on 4G, white on 5G). The access
+# technology changes under a live connection, so the watchdog asks again on every round.
+led_up() {
+    # CEREG is a short local-status read; COPS can take about two seconds on
+    # weak service and used to hold an AT channel on every watchdog round.
+    # F50's legacy mu300-led maps both 4G and 5G to blue, so only led-status
+    # may drive its RGB lamp. U30 Air keeps its separate legacy network LEDs.
+    act=$(at 'AT+CEREG?' 4 2>/dev/null | grep '+CEREG:' | head -1 | awk -F, '{print $NF}' | tr -d '" ')
+    case "$act" in
+        11|12|13|15)
+            led-status online-5g 2>/dev/null || true
+            [ "$DEVICE" = u30air ] && led 5g
+            ;;
+        *)
+            led-status online-4g 2>/dev/null || true
+            [ "$DEVICE" = u30air ] && led on
+            ;;
+    esac
+}
+
+# radio.log：radio_on 的每一步决策都留一行，重启后可以逐行对账（V50 开机提速研究，docs/FINDINGS.md §43）。
+radio_say() { printf 't=%-9s %s\n' "$(cut -d' ' -f1 /proc/uptime)" "$*" >>/etc/mu300/radio.log 2>/dev/null || true; }
+# 开机时间线打点：bootmark 把 /proc/uptime 追加到 /etc/mu300/boot-timeline.txt
+mark() { [ -x /opt/mu300/bin/bootmark ] && /opt/mu300/bin/bootmark "$@" || true; }
+
+ATLOCK=/run/mu300-at/owner
+
+# Is that pid a live process that holds the AT channel? mu300-atd and the direct path below both write their
+# pid into $ATLOCK/pid, and a bare pid says nothing once the number has been reused.
+at_owner_alive() {
+    [ -n "${1:-}" ] && [ -d "/proc/$1" ] &&
+        tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -qE 'mu300-atd|mobile-data'
+}
+
+at() {  # at CMD [timeout] -> response lines up to the final result code
+    local cmd=$1 t=${2:-5} line owner
+    # mobile-data gets its own AT channel (nr2, same slot-0 group as nr1): AT+CGDATA
+    # blocks its channel for 10-20 s, and having it on the shared nr1 made every other
+    # AT user (toolkit signal checks, SMS) wait behind it. The nr2 daemon serves only
+    # this script, so the dial-up sequence never contends with anything.
+    if [ -p /run/mu300-at2/cmd ]; then
+        MU300_AT_DIR=/run/mu300-at2 /opt/mu300/bin/mu300-at -t "$t" "$cmd"
+        return
+    fi
+    # fall through to the shared nr1 daemon when the nr2 one is not running yet
+    if [ -p /run/mu300-at/cmd ]; then
+        /opt/mu300/bin/mu300-at -t "$t" "$cmd"
+        return
+    fi
+    [ -c "$DEV" ] || return 1   # never let the redirection create a regular file in /dev
+    # No command fifo, but the daemon can still be there with the channel open - that is what /run/mu300-at
+    # being removed under a running mu300-atd leaves behind. Opening the device here would make a second reader
+    # on a channel that hands each line to exactly one of them, so every command from then on reads somebody
+    # else's answer or nothing at all. Hold the daemon's own lock for the length of this command instead.
+    owner=$(cat "$ATLOCK/pid" 2>/dev/null || true)
+    if at_owner_alive "$owner" && [ "$owner" != $$ ]; then
+        echo "pid $owner holds $DEV and its command fifo is gone; restart mu300-atd" >&2
+        return 1
+    fi
+    mkdir -p "${ATLOCK%/*}" 2>/dev/null || true
+    mkdir "$ATLOCK" 2>/dev/null || { rm -rf "$ATLOCK"; mkdir "$ATLOCK" 2>/dev/null || return 1; }
+    echo $$ > "$ATLOCK/pid"
+    exec 3<>"$DEV"
+    # drop late responses/URCs left over from earlier commands
+    while IFS= read -r -t 0.2 line <&3; do :; done
+    printf '%s\r' "$cmd" >&3
+    local end=$((SECONDS + t))
+    while [ $SECONDS -lt $end ]; do
+        IFS= read -r -t 1 line <&3 || continue
+        line=${line%$'\r'}
+        [ -z "$line" ] && continue
+        case "$line" in
+            +CSQ:*|+CESQ:*|+SPPCI:*|+ECIND:*|+SIND:*|+CREG:*|+CGREG:*|+SPNRINDICATE:*|+CTZV:*|^CONN:*|+SPERRLOG:*)
+                [ "${cmd#AT+CSQ}" != "$cmd" ] && [ "${line#+CSQ:}" != "$line" ] && echo "$line"
+                continue ;;
+        esac
+        echo "$line"
+        case "$line" in OK|ERROR|+CME\ ERROR*|+CMS\ ERROR*|CONNECT*|NO\ CARRIER) break ;; esac
+    done
+    exec 3>&-
+    rm -rf "$ATLOCK"
+}
+
+# dotted netmask -> prefix length, in shell: the image has no python3 and a wrong prefix leaves the interface
+# with /32 and no on-link subnet
+mask2prefix() {
+    local m=$1 o bits=0
+    case "$m" in
+        [0-9]*.[0-9]*.[0-9]*.[0-9]*) ;;
+        *) echo 32; return ;;
+    esac
+    local IFS=.
+    for o in $m; do
+        case $o in
+            255) bits=$((bits + 8)) ;;
+            254) bits=$((bits + 7)) ;;
+            252) bits=$((bits + 6)) ;;
+            248) bits=$((bits + 5)) ;;
+            240) bits=$((bits + 4)) ;;
+            224) bits=$((bits + 3)) ;;
+            192) bits=$((bits + 2)) ;;
+            128) bits=$((bits + 1)) ;;
+            0) ;;
+            *) echo 32; return ;;
+        esac
+    done
+    echo "$bits"
+}
+
+# Interface identifier (the low 64 bits, as a:b:c:d) of the IPv6 address the network assigned to the context, or
+# nothing when it gave IPv4 only. This, not MU300_PDP_TYPE, decides whether there is IPv6: a context that was
+# never redefined is whatever the modem kept (IPV4V6 on this one), and a carrier may answer IPV4V6 with IPv4 alone.
+# +CGPADDR: <cid>,<addr>[,<addr>]; with +CGPIAF 0 an IPv6 address is 16 dotted bytes, otherwise it is hex.
+v6_iid() {
+    at "AT+CGPADDR=$CID" 4 | awk -F'[ ,"]+' '/^\+CGPADDR:/ {
+        for (i = 3; i <= NF; i++) {
+            if (split($i, b, ".") == 16) {
+                printf "%x:%x:%x:%x\n", b[9] * 256 + b[10], b[11] * 256 + b[12], b[13] * 256 + b[14], b[15] * 256 + b[16]
+                exit
+            }
+            if ($i ~ /:/) {
+                s = $i
+                if (s ~ /::/) {   # expand "::" to the zero groups it stands for
+                    h = s; sub(/::.*/, "", h); t = s; sub(/.*::/, "", t)
+                    nh = (h == "") ? 0 : split(h, x, ":"); nt = (t == "") ? 0 : split(t, y, ":")
+                    s = h; for (j = 0; j < 8 - nh - nt; j++) s = s (s == "" ? "" : ":") "0"
+                    if (t != "") s = s ":" t
+                }
+                if (split(s, g, ":") == 8) { print g[5] ":" g[6] ":" g[7] ":" g[8]; exit }
+            }
+        }
+    }' | grep -v '^[0:]*$' || true
+}
+
+LAN6=/run/mu300-mobile-data-lan6   # the prefix address we put on br-lan, so down() removes only that one
+
+# IPv6 on the systemd path. The bearer is point-to-point: the network routes the whole /64 of its router
+# advertisement to us and never asks neighbour discovery for it. So the /64 is learnt from the RA on sipa_eth0 and
+# then moved to br-lan, where dnsmasq (lan-start, constructor:br-lan) advertises it to USB and Wi-Fi clients.
+# Keeping it on sipa_eth0 as well would give the kernel two routes to the same /64.
+v6_up() {  # v6_up IID
+    local c=/proc/sys/net/ipv6/conf/$IFACE prefix= n
+    [ -w "$c/disable_ipv6" ] || return 0
+    echo 1 > "$c/disable_ipv6"          # start clean: no address or route left from an earlier session
+    echo 2 > "$c/accept_ra"             # forwarding is on, and a router ignores RAs with the usual 1
+    echo 0 > "$c/accept_ra_defrtr"      # the default route is set below, as for IPv4
+    echo 1 > "$c/accept_ra_pinfo"
+    # 3GPP has the UE build its link-local address from the identifier the network assigned (Android does the
+    # same); the kernel's own EUI-64 one would come from sipa_eth0's made-up MAC
+    echo 1 > "$c/addr_gen_mode"
+    echo 0 > "$c/disable_ipv6"
+    ip -6 addr add "fe80::$1/64" dev "$IFACE" 2>/dev/null || true
+    for n in $(seq 1 20); do
+        prefix=$(ip -6 -o addr show dev "$IFACE" scope global | awk '{ print $4; exit }')
+        [ -n "$prefix" ] && break
+        sleep 1
+    done
+    ip -6 route replace default dev "$IFACE" metric 100
+    if [ -z "$prefix" ]; then
+        echo "the network assigned IPv6 but sent no router advertisement; IPv6 is not shared with the LAN" >&2
+        return 0
+    fi
+    prefix=$(prefix64 "${prefix%/*}")
+    sysctl -qw net.ipv6.conf.all.forwarding=1
+    if ip link show br-lan >/dev/null 2>&1; then
+        echo 0 > "$c/accept_ra_pinfo"   # or the next RA puts the address back
+        ip -6 addr flush dev "$IFACE" scope global
+        ip -6 route del "${prefix}/64" dev "$IFACE" 2>/dev/null || true
+        # br-lan hears dnsmasq's own advertisements; seen on the device, it took two more SLAAC addresses of
+        # the prefix from them while forwarding was still off
+        echo 0 > /proc/sys/net/ipv6/conf/br-lan/accept_ra
+        v6_lan_down
+        ip -6 addr add "${prefix}1/64" dev br-lan
+        echo "${prefix}1/64" > "$LAN6"
+    fi
+    nft -f - <<NFT
+table ip6 mu300_v6
+delete table ip6 mu300_v6
+table ip6 mu300_v6 {
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        tcp flags syn tcp option maxseg size set rt mtu
+    }
+}
+NFT
+    echo "IPv6 up on $IFACE, ${prefix}/64 shared on br-lan"
+}
+
+# "2001:db8:1:2:a:b:c:d" -> "2001:db8:1:2::" (the first four groups, for a /64 advertised by the network)
+prefix64() {
+    echo "$1" | awk -F: '{
+        s = $0
+        if (s ~ /::/) { h = s; sub(/::.*/, "", h); t = s; sub(/.*::/, "", t)
+            nh = (h == "") ? 0 : split(h, x, ":"); nt = (t == "") ? 0 : split(t, y, ":")
+            s = h; for (j = 0; j < 8 - nh - nt; j++) s = s (s == "" ? "" : ":") "0"
+            if (t != "") s = s ":" t }
+        split(s, g, ":"); print g[1] ":" g[2] ":" g[3] ":" g[4] "::"
+    }'
+}
+
+v6_lan_down() {
+    [ -f "$LAN6" ] && ip -6 addr del "$(cat "$LAN6")" dev br-lan 2>/dev/null || true
+    rm -f "$LAN6"
+}
+
+v6_off() {
+    v6_lan_down
+    nft delete table ip6 mu300_v6 2>/dev/null || true
+    ip -6 route del default dev "$IFACE" 2>/dev/null || true
+    [ -w "/proc/sys/net/ipv6/conf/$IFACE/disable_ipv6" ] && echo 1 > "/proc/sys/net/ipv6/conf/$IFACE/disable_ipv6"
+    return 0
+}
+
+# Make sure the radio is on (CFUN=1). SFUN=4 alone is enough from any state; the off/on cycle is the last resort,
+# because an interrupted cycle used to leave the radio switched off with nothing to turn it back on.
+# 开机这一段踩过两个坑（V50 开机提速研究的实测，docs/FINDINGS.md §43），顺序是按实测重排的：
+#   1) modem_control 把 CP 放出来之后，SIPC 的 AT 口要十几秒才通，实测第一次回话是
+#      "+CFUN: 0" —— 射频关着。所以在拿到回话之前一个小命令都不要发：发出去没人接，
+#      只会把自己和后面排队的命令一起拖住（mu300-at 的全局锁）。
+#   2) 旧代码是「AT+SFUN=4 之后立刻问一次 CFUN?，问不到就跳到 SFUN=2 + SFUN=4 的断电重启」。
+#      实测那一步会把刚起来的 CP 又清一次，白等一整轮 CP 启动（12 s 起）。SFUN=4 之后要等
+#      射频真正上来，而不是问一次就走。
+radio_on_locked() {
+    local i=0 out silent=0 answered=0 urclog=/run/mu300-at/urc/stty_nr0.log
+    local ready_deadline=$((SECONDS + ${MU300_CFUN_WAIT:-30}))
+    mark radio-on-enter
+
+    # CP readiness is announced on nr0. Wait on that event source before taking
+    # the command-channel lock; repeatedly sending CFUN? while CP is still
+    # booting only queues timeouts and starves the other AT clients.
+    while [ "$SECONDS" -lt "$ready_deadline" ]; do
+        [ -s "$urclog" ] && break
+        sleep 0.2 2>/dev/null || sleep 1
+    done
+
+    # Android's slot-0 RIL opens nr0/nr1/nr2 and makes SMMSWAP=0 the first
+    # command on nr1. Do the same once per boot, before CFUN or any dial-up
+    # command. Reuse the existing readiness budget: failure ends this round
+    # immediately instead of adding another wait or sending recovery commands
+    # into a channel that has not completed its RIL handshake.
+    if [ ! -e /run/mu300-ril-handshake ]; then
+        # A dashboard/watch probe can own the client mutex for a fraction of a
+        # second as nr1 becomes ready. Give that collision one second instead
+        # of abandoning this boot attempt and waiting for netifd's next retry.
+        out=$(MU300_AT_LOCK_WAIT=1 MU300_AT_DIR=/run/mu300-at \
+            /opt/mu300/bin/mu300-at -t 4 'AT+SMMSWAP=0' 2>&1 || true)
+        case "$out" in
+            *OK*)
+                : > /run/mu300-ril-handshake
+                radio_say "slot0 RIL 握手完成（AT+SMMSWAP=0）"
+                mark ril-handshake-done
+                ;;
+            *)
+                radio_say "slot0 RIL 握手无有效回应，本轮立即结束：$(echo "${out:-无回答}" | tr -s '\n' ' ')"
+                return 1
+                ;;
+        esac
+    fi
+    out=$(at 'AT+CFUN?' 4 2>&1 || true)
+    case "$out" in
+        *"+CFUN: 1"*) return 0 ;;
+        *"+CFUN: 0"*) ;;
+        *)
+            radio_say "AT 通道没有回应，停止本轮，不向死通道发送 SFUN：$(echo "${out:-无回答}" | tr -s '\n' ' ')"
+            return 1 ;;
+    esac
+    # The optional standalone LuCI plugin may have saved mode/band/cell locks.
+    # This is the one safe early window: nr1 has completed SMMSWAP, the CP
+    # answers, and RF is still off. A failed readback leaves the plugin's late
+    # worker armed; never make radio startup depend on the plugin.
+    if [ -x /usr/libexec/unisoc-modem/lock ] &&
+       [ ! -e /run/unisoc-modem-lock-replay-done ]; then
+        /usr/libexec/unisoc-modem/lock replay early ||
+            radio_say "early lock replay unverified; late fallback remains armed"
+    fi
+    radio_say "AT 通道已就绪，射频为 0；发送 SFUN=4"
+    at 'AT+SFUN=4' "${MU300_SFUN_TIMEOUT:-20}" >/dev/null || true
+    i=0
+    while [ "$i" -lt "${MU300_CFUN_UP_WAIT:-30}" ]; do
+        out=$(at 'AT+CFUN?' 4 2>&1 || true)
+        case "$out" in
+            *"+CFUN: 1"*) radio_say "AT+SFUN=4 之后 ${i}s 射频到 1"; return 0 ;;
+            *"+CFUN:"*) answered=1; silent=0 ;;
+            *) silent=$((silent + 1)) ;;
+        esac
+        # A vanished command channel cannot execute the recovery commands. Stop
+        # promptly and let the outer watcher retry instead of burning minutes.
+        [ "$silent" -ge 2 ] && { radio_say "SFUN=4 后 AT 通道沉默，快速结束本轮"; return 1; }
+        sleep 2; i=$((i + 2))
+    done
+    [ "$answered" = 1 ] || return 1
+    radio_say "AT+SFUN=4 之后 ${i}s 射频仍然不是 1，走最后的断电重启（SFUN=2 -> SFUN=4）"
+    at 'AT+SFUN=2' 5 >/dev/null || true
+    at 'AT+SFUN=4' 20 >/dev/null || true
+    at 'AT+CFUN?' 4 | grep -q '+CFUN: 1'
+}
+
+# The early radio warm-up and netifd may meet at the boundary. Serialize that
+# small window so they never run two CFUN/SFUN state machines in parallel.
+# The collision wait is capped at eight seconds; netifd can retry later.
+radio_on() {
+    local lock=/run/mu300-radio-on.lock owner= n=0 rc
+    while ! mkdir "$lock" 2>/dev/null; do
+        owner=$(cat "$lock/pid" 2>/dev/null || true)
+        if [ -z "$owner" ] || [ ! -d "/proc/$owner" ] ||
+           ! tr '\0' ' ' < "/proc/$owner/cmdline" 2>/dev/null | grep -q mobile-data; then
+            rm -rf "$lock"
+            continue
+        fi
+        n=$((n + 1))
+        [ "$n" -gt 80 ] && return 1
+        /opt/mu300/bin/busybox sleep 0.1 2>/dev/null || sleep 1
+    done
+    echo $$ > "$lock/pid"
+    radio_on_locked
+    rc=$?
+    [ "$(cat "$lock/pid" 2>/dev/null)" = $$ ] && rm -rf "$lock"
+    # Keep the generic worker away from nr1 until the handshake/radio sequence
+    # has actually completed. A failed round is retried by netifd/watch.
+    [ "$rc" = 0 ] && rm -f /run/unisoc-modem-early-hook-pending
+    return $rc
+}
+
+# 取 PDP 地址。AT+CGACT? 回答 1,1 并不等于地址已经下发：实测在 NR 上有过「CGACT 通了之后
+# 40 s 还不给地址」的情况（开机那次第一次拨号就是这么失败的）。所以这里可以反复问，失败时由
+# 调用方决定怎么办。
+# 成功时把 +CGCONTRDP 那一行留在全局 rdp 里（后面的解析继续用它）。
+# 预算是真实秒。按轮数算的话「8」会变成 4 轮 —— 每轮是一条 AT 往返（实测约 2 s）加 sleep 2，
+# 也就是 17 s 才放弃。这里的每一秒都算在开机时间里，所以到点就走。
+fetch_addr() {   # $1 = 预算秒（真实秒，不是轮数）
+    local lim=${1:-8} end line am
+    rdp=
+    end=$((SECONDS + lim))
+    while [ "$SECONDS" -lt "$end" ]; do
+        line=$(at "AT+CGCONTRDP=$CID" 4 2>&1 | grep '^+CGCONTRDP:' | head -1 || true)
+        am=$(echo "$line" | cut -d, -f4 | tr -d '"')
+        case "$am" in
+            ''|0.0.0.0*) : ;;
+            *.*.*.*) rdp=$line; return 0 ;;
+        esac
+        sleep 2
+    done
+    return 1
+}
+
+is_registered() {
+    # Query form: +CEREG: <n>,<stat>,...; unsolicited form: +CEREG: <stat>,...
+    grep -qE '^\+CEREG: (1|5)(,|$)|^\+CEREG: [0-9]+,(1|5)(,|$)'
+}
+
+wait_registered() {
+    local urclog=/run/mu300-at/urc/stty_nr0.log out start size
+    local deadline=$((SECONDS + ${MU300_REGISTER_WAIT:-60}))
+    local next_query=$SECONDS
+
+    # nr0 reports registration changes immediately. Watch only bytes appended
+    # after this point so an old registered URC cannot be mistaken for the
+    # current state. A low-rate query is the fallback for a carrier that emits
+    # no URC; this replaces the old 0.3 s AT+CEREG? flood.
+    size=$(wc -c < "$urclog" 2>/dev/null || echo 0)
+    start=$((size + 1))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        size=$(wc -c < "$urclog" 2>/dev/null || echo 0)
+        [ "$size" -lt "$start" ] && start=1
+        if [ -f "$urclog" ] && tail -c +"$start" "$urclog" 2>/dev/null | is_registered; then
+            return 0
+        fi
+        if [ "$SECONDS" -ge "$next_query" ]; then
+            out=$(at 'AT+CEREG?' 3 2>&1 || true)
+            echo "$out" | is_registered && return 0
+            next_query=$((SECONDS + 5))
+        fi
+        sleep 0.2 2>/dev/null || sleep 1
+    done
+    return 1
+}
+
+# The modem needs the vendor modem loader/SIPC drivers (5.4 kernel); a kernel without them (mainline) has no modem.
+modem_stack() { [ -e /dev/modem ] || [ -e /dev/pmsys ] || [ -c "$DEV" ]; }
+
+# "stty -F" opens and closes the tty, which desynchronises the SIPC channel (docs/FINDINGS.md 13b). When
+# mu300-atd owns the device it has already set the flags on its own descriptor, so leave the tty alone.
+tty_setup() {
+    [ -p /run/mu300-at/cmd ] && return 0
+    # same for a daemon whose fifo has gone missing: its descriptor is still the one the modem talks to
+    at_owner_alive "$(cat "$ATLOCK/pid" 2>/dev/null || true)" && return 0
+    stty -F "$DEV" raw -echo 2>/dev/null || true
+}
+
+# Only one bring-up at a time: the watchdog and the service can both decide to reconnect, and two of them race for
+# every AT command (each losing the channel lock in turn, so neither finishes).
+UPLOCK=/run/mu300-mobile-data-up.lock
+up() {
+    # Wait for a bring-up that is already running instead of returning: the netifd protocol handler reads the
+    # address out of our output, so an early return reads as "attach failed" and netifd tears the interface
+    # down and tries again every 20 s, which piles up half-finished bring-ups and teardowns.
+    local n=0 p=
+    while ! mkdir "$UPLOCK" 2>/dev/null; do
+        p=$(cat "$UPLOCK/pid" 2>/dev/null || true)
+        if [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then rm -rf "$UPLOCK"; continue; fi
+        n=$((n + 1))
+        if [ "$n" -gt 150 ]; then
+            echo "another bring-up has been running for over two minutes (pid $p)" >&2
+            return 1
+        fi
+        sleep 1
+    done
+    echo $$ > "$UPLOCK/pid"
+    up_locked "$@"
+    local rc=$?
+    rm -rf "$UPLOCK"
+    return $rc
+}
+
+up_locked() {
+    modem_stack || { echo "no modem stack in this kernel ($(uname -r))" >&2; exit 3; }
+    rm -f /run/mu300-mobile-data-down
+    tty_setup
+    radio_on
+    mark dial-radio-on-done
+    # Android's RIL enables the IMS bearer used by SMS. This is idempotent;
+    # keep it on the normal radio bring-up path and do not wait for IMS here.
+    at 'AT+CAVIMS=1' 5 >/dev/null || true
+    wait_registered || { echo "not registered on the network" >&2; exit 1; }
+    mark dial-registered
+    radio_say "注册完成"
+
+    # sipa_dele must probe after the CP packet domain exists but before the PDP
+    # resource graph becomes active. Loading it later raced CGACT and produced
+    # a reproducible CFI panic in sipa_delegate. extra-modules deliberately
+    # leaves this step to us on OpenWrt so the order is deterministic.
+    _m=/lib/modules/$(uname -r)
+    if { [ -f "$_m/sipa-dele.ko" ] || [ -f "$_m/extra/sipa-dele.ko" ]; } &&
+       ! grep -q '^sipa_dele ' /proc/modules; then
+        MU300_DELE_WAIT=20 /opt/mu300/bin/sipa-dele-start >/tmp/mu300-sipa-dele.log 2>&1 || {
+            echo "sipa delegate did not become ready; refusing unsafe PDP activation" >&2
+            exit 1
+        }
+        grep -q '^sipa_dele ' /proc/modules || {
+            echo "sipa delegate load returned without a module" >&2
+            exit 1
+        }
+    fi
+    # systemd has no way to pass an argument from a config file, so the APN can come from the environment too:
+    # /etc/mu300/mobile-data.conf is an EnvironmentFile for the service. The argument still wins, which is what
+    # the OpenWrt protocol handler uses.
+    set -- "${1:-${MU300_APN:-}}"
+    if [ -n "${1:-}" ]; then
+        # "IP", not "IPV4V6", because that is what Android's RIL asks this modem for. Measured on the same
+        # device with data working, its sipa_eth0 carries one IPv4 address and has IPv6 switched off outright
+        # (/proc/sys/net/ipv6/conf/sipa_eth0/disable_ipv6 = 1). A dual-stack context is the one part of our
+        # bring-up the working system never performs, and downlink is what we are missing (FINDINGS 13f).
+        # MU300_PDP_TYPE=IPV4V6 asks for both again, for a carrier that needs it.
+        at "AT+CGDCONT=$CID,\"${MU300_PDP_TYPE:-IP}\",\"$1\"" >/dev/null
+    fi
+    # 不再先问一次 AT+CGACT?：开机时上下文一定是关的，问那一趟是一条整 AT 往返（实测约 2 s），
+    # 而 CGACT=1 对已经激活的上下文是幂等的（重拨、watch 重连就是这种情况），所以问不问结果一样。
+    at "AT+CGACT=1,$CID" 20 >/dev/null
+    mark dial-pdp-active
+    # 激活成功不等于地址已经下发。Do not cycle CGACT=0/1 here: two measured
+    # boots showed that tearing down the just-created context made the AT
+    # channel silent and held WAN pending for minutes. Reasserting CGACT=1 is
+    # idempotent and nudges the existing context without resetting the CP. Keep
+    # both phases bounded; this path is at most 16 s instead of the old 57 s.
+    if ! fetch_addr "${MU300_ADDR_WAIT_FIRST:-8}"; then
+        radio_say "CGACT 已激活但暂未下发地址；幂等重发一次，不切断 PDP"
+        at "AT+CGACT=1,$CID" 8 >/dev/null || true
+        fetch_addr "${MU300_ADDR_WAIT_RETRY:-8}" || {
+            echo "no IPv4 address from AT+CGCONTRDP after bounded CGACT reassert" >&2; exit 1; }
+    fi
+    mark dial-addr-ok
+    # +CGCONTRDP: cid,bearer,apn,"a.b.c.d.m.m.m.m",gw,dns1,dns2,...
+    addrmask=$(echo "$rdp" | cut -d, -f4 | tr -d '"')
+    ip4=$(echo "$addrmask" | cut -d. -f1-4)
+    mask=$(echo "$addrmask" | cut -d. -f5-8)
+    dns1=$(echo "$rdp" | cut -d, -f6 | tr -d '"')
+    dns2=$(echo "$rdp" | cut -d, -f7 | tr -d '"')
+    [ -n "$ip4" ] || { echo "no IPv4 address from AT+CGCONTRDP" >&2; exit 1; }
+    # AT+CGDATA takes its time on this modem: measured, it answers "^ORIG: <cid>,<n>" and then CONNECT about
+    # ten to twenty seconds later. With the old eight-second budget the reply arrived after we had given up, so
+    # the next command read it instead of its own and the whole channel looked dead for a while.
+    at "AT+CGDATA=\"M-ETHER\",$CID" 45 | grep -q CONNECT || echo "AT+CGDATA did not answer CONNECT" >&2
+    prefix=$(mask2prefix "$mask")
+    iid=$(v6_iid)
+    # Without an IPv6 address from the network, switch IPv6 off on this interface, as Android does: otherwise it
+    # carries a link-local address and sends router solicitations and multicast into a bearer that is IPv4 only
+    # (FINDINGS 13f). With one, v6_up below (systemd) or the proto handler (OpenWrt) sets it up.
+    # On OpenWrt this is undone a moment later - netifd turns IPv6 back on while it configures the interface -
+    # so the proto handler repeats it after proto_send_update. Here it is for the systemd path, which configures
+    # the interface itself and where it sticks.
+    if [ "${MU300_PDP_TYPE:-IP}" = IP ] && [ -w "/proc/sys/net/ipv6/conf/$IFACE/disable_ipv6" ]; then
+        echo 1 > "/proc/sys/net/ipv6/conf/$IFACE/disable_ipv6"
+    fi
+    # IPV4V6: the carrier's RA is the only way this bearer ever gets its IPv6 address - measured on
+    # China Telecom IoT (ctiot): CGCONTRDP/CGPADDR keep a ::1-style placeholder forever even with the
+    # context active AND CGDATA connected, but with accept_ra enabled the kernel solicits and the
+    # GGSN answers with a real 240e::/20 prefix (SLAAC, default route included). 2, not 1: this is a
+    # router (forwarding on), and netifd leaves the knob at 0 for a v4-only proto.
+    if [ "${MU300_PDP_TYPE:-IP}" != IP ]; then
+        [ -w "/proc/sys/net/ipv6/conf/$IFACE/disable_ipv6" ] && echo 0 > "/proc/sys/net/ipv6/conf/$IFACE/disable_ipv6"
+        [ -w "/proc/sys/net/ipv6/conf/$IFACE/accept_ra" ] && echo 2 > "/proc/sys/net/ipv6/conf/$IFACE/accept_ra"
+    fi
+    # Select the steady network colour before returning to netifd. Previously
+    # this lived after the return, so every OpenWrt connection stayed forever
+    # in the earlier "modem" blink state.
+    act=$(at 'AT+CEREG?' 2>/dev/null | grep '+CEREG:' | head -1 | awk -F',' '{print $NF}' | tr -d '" ')
+    case "$act" in
+        11|12|13|15) led-status online-5g 2>/dev/null || true ;;
+        *)           led-status online-4g 2>/dev/null || true ;;
+    esac
+    if [ "${MU300_NETIFD:-0}" = 1 ]; then
+        # OpenWrt: netifd (proto mu300cell) configures the address, routes, DNS and firewall itself
+        printf 'IFACE=%s\nIP=%s\nPREFIX=%s\nDNS1=%s\nDNS2=%s\nIID6=%s\n' "$IFACE" "$ip4" "$prefix" "$dns1" "$dns2" "$iid"
+        return 0
+    fi
+    ip link set "$IFACE" up
+    # the sipa driver hands up wrong hardware checksums ("hw csum failure" warnings): verify them in software
+    ethtool -K "$IFACE" rx off 2>/dev/null || true
+    ip addr flush dev "$IFACE"
+    ip addr add "$ip4/$prefix" dev "$IFACE"
+    ip route replace default dev "$IFACE" metric 100
+    if command -v resolvectl >/dev/null; then
+        resolvectl dns "$IFACE" $dns1 $dns2 || true
+        resolvectl domain "$IFACE" '~.' || true
+    fi
+    # share the connection with USB/Wi-Fi clients (dnsmasq on usb0 already hands out this device as router/DNS)
+    sysctl -qw net.ipv4.ip_forward=1
+    nft -f - <<NFT
+table ip mu300_nat
+delete table ip mu300_nat
+table ip mu300_nat {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "$IFACE" masquerade
+    }
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        tcp flags syn tcp option maxseg size set rt mtu
+    }
+}
+NFT
+    # 运营商名字是一条 AT 往返（实测约 2 s），不影响能不能上网：成功回话在关键路径上打印，
+    # 运营商那半句挪到后台的 radio.log（V50 开机提速研究的「收尾 AT 后台化」）。
+    echo "mobile data up on $IFACE ($ip4/$prefix)"
+    ( radio_say "运营商 $(at 'AT+COPS?' 4 2>&1 | tr -s '\n' ' ' || true)" ) >/dev/null 2>&1 &
+}
+
+down() {
+    touch /run/mu300-mobile-data-down   # tells watch not to reconnect
+    led-status offline 2>/dev/null
+    nft delete table ip mu300_nat 2>/dev/null || true
+    v6_off
+    ip route del default dev "$IFACE" 2>/dev/null || true
+    ip addr flush dev "$IFACE" 2>/dev/null || true
+    ip link set "$IFACE" down 2>/dev/null || true
+    # Deactivating the context is a courtesy to the network, not a requirement: the modem is restarted on the
+    # next boot anyway. During a shutdown mu300-atd is going away at the same time, so asking it anything only
+    # delays the reboot - skip it there, and keep the wait short everywhere else.
+    if [ "$(systemctl is-system-running 2>/dev/null)" = stopping ]; then
+        return 0
+    fi
+    # A bring-up in progress owns the AT channel; asking it to deactivate the context now only makes both wait
+    local upp=$(cat "$UPLOCK/pid" 2>/dev/null || true)
+    if [ -n "$upp" ] && kill -0 "$upp" 2>/dev/null; then
+        return 0
+    fi
+    tty_setup
+    export MU300_AT_LOCK_WAIT=5
+    at "AT+CGACT=0,$CID" 5 >/dev/null || true
+}
+
+sim_reset() {
+    tty_setup
+    at 'AT+SFUN=5' 20; at 'AT+SFUN=3' 10; sleep 2; at 'AT+SFUN=2' 10; at 'AT+SFUN=4' 30
+    for _ in $(seq 1 30); do at 'AT+CPIN?' | grep -q READY && break; sleep 2; done
+    at 'AT+CPIN?'
+}
+
+# The modem firmware occasionally resets itself (modem_control reloads it); it comes back with the radio off and
+# no PDP context, which Android's RIL repairs silently. Check the context every 30 s and reconnect when it is gone.
+watch() {
+    local fails=0
+    # one watchdog is enough: procd and systemd have both been seen starting a second one
+    local wlock=/run/mu300-mobile-data-watch.lock wp=
+    while ! mkdir "$wlock" 2>/dev/null; do
+        wp=$(cat "$wlock/pid" 2>/dev/null || true)
+        # a live pid is not enough: the number gets reused, and taking the lock from a watchdog that is still
+        # running puts two of them on the AT channel
+        if at_owner_alive "$wp"; then
+            echo "another watchdog is already running (pid $wp)" >&2
+            exit 0
+        fi
+        rm -rf "$wlock"
+    done
+    echo $$ > "$wlock/pid"
+    trap 'rm -rf "$wlock"' EXIT INT TERM
+    modem_stack || { echo "no modem stack in this kernel ($(uname -r)), not watching" >&2; exit 0; }
+    while :; do
+        sleep "${MU300_WATCH_INTERVAL:-30}"
+        [ -e /run/mu300-mobile-data-down ] && continue
+        [ -c "$DEV" ] || continue
+        tty_setup
+        if at "AT+CGACT?" | grep -q "+CGACT:$CID,1" && ip -4 addr show "$IFACE" 2>/dev/null | grep -q inet; then
+            # An active context is not enough: after the radio or the network dropped the bearer, an LTE modem
+            # attaches again by itself and the context comes back with a new address, while the interface keeps
+            # the old one - it sends with it and nothing ever comes back (measured: rx 0, the modem on
+            # 10.160.167.97, sipa_eth0 on 10.200.191.225). Reconnect as soon as the two differ.
+            # the context's IPv4 address: the first field after the cid when it has four parts (an IPv6 one has 16)
+            want=$(at "AT+CGPADDR=$CID" 4 | awk -F'[ ,"]+' '/^\+CGPADDR:/ { if (split($3, o, ".") == 4 && $3 != "0.0.0.0") print $3; exit }' || true)
+            have=$(ip -4 -o addr show "$IFACE" 2>/dev/null | awk '{ split($4, a, "/"); print a[1]; exit }' || true)
+            if [ -z "$want" ] || [ "$want" = "$have" ]; then
+                fails=0
+                led_up
+                continue
+            fi
+            echo "the network gave the context a new address ($want; $IFACE still has $have), reconnecting" >&2
+            fails=1   # no second look needed: the next step reconnects
+        fi
+        # a switched-off radio never comes back on its own
+        at 'AT+CFUN?' 4 | grep -q '+CFUN: 1' || { echo "radio was off, switching it on" >&2; radio_on || true; }
+        fails=$((fails + 1))
+        [ "$fails" -lt 2 ] && continue
+        echo "mobile data lost (modem reset or detached), reconnecting" >&2
+        led-status offline 2>/dev/null || true
+        [ "$DEVICE" = u30air ] && led off
+        if [ "${MU300_NETIFD:-0}" = 1 ]; then
+            ifup "${MU300_WAN:-wan}"   # OpenWrt: let netifd run the mu300cell protocol again
+        else
+            ( up ) || echo "reconnect failed, retrying" >&2
+        fi
+        fails=0
+    done
+}
+
+# Radio quality in human terms. The AT channel belongs to whoever asks first, so the watchdog is paused by the
+# caller (mu300-toolkit does this); reading these values never disturbs an established data connection.
+signal() {
+    tty_setup
+    local cops cereg cesq csq rsrp rsrq act mcc oper tac cell rat q
+    cops=$(at 'AT+COPS?' 4 | grep '^+COPS:' || true)
+    cereg=$(at 'AT+CEREG?' 4 | grep '^+CEREG:' || true)
+    cesq=$(at 'AT+CESQ' 4 | grep '^+CESQ:' || true)
+    csq=$(at 'AT+CSQ' 4 | grep '^+CSQ:' || true)
+    oper=$(echo "$cops" | sed -n 's/.*"\([^"]*\)".*/\1/p')
+    act=$(echo "$cops" | awk -F, '{gsub(/ /, "", $4); print $4}')
+    tac=$(echo "$cereg" | awk -F'"' '{print $2}')
+    cell=$(echo "$cereg" | awk -F'"' '{print $4}')
+    # +CESQ: rxlev,ber,rscp,ecno,rsrq,rsrp[,ssrsrq,ssrsrp,sssinr]
+    rsrq=$(echo "$cesq" | awk -F'[,:]' '{gsub(/ /, "", $6); print $6}')
+    rsrp=$(echo "$cesq" | awk -F'[,:]' '{gsub(/ /, "", $7); print $7}')
+    case $act in
+        7) rat="LTE" ;;
+        13) rat="5G NSA (LTE + NR)" ;;
+        11|12) rat="5G" ;;
+        2|4|5|6) rat="3G" ;;
+        0|1|3) rat="2G" ;;
+        *) rat="unknown (AcT $act)" ;;
+    esac
+    printf 'operator     %s (%s)\n' "${oper:-unknown}" "$rat"
+    if [ -n "$rsrp" ] && [ "$rsrp" != 255 ] 2>/dev/null; then
+        # 3GPP mapping: RSRP index 0..97 = -140..-44 dBm, RSRQ index 0..34 = -19.5..-3 dB
+        local rsrp_dbm rsrq_db
+        rsrp_dbm=$((rsrp - 140))
+        rsrq_db=$(awk -v i="$rsrq" 'BEGIN { printf "%.1f", -19.5 + i * 0.5 }')
+        if [ "$rsrp_dbm" -ge -85 ]; then q="excellent"
+        elif [ "$rsrp_dbm" -ge -95 ]; then q="good"
+        elif [ "$rsrp_dbm" -ge -105 ]; then q="fair"
+        elif [ "$rsrp_dbm" -ge -115 ]; then q="weak"
+        else q="very weak"; fi
+        printf 'signal       RSRP %s dBm (%s), RSRQ %s dB\n' "$rsrp_dbm" "$q" "$rsrq_db"
+    else
+        printf 'signal       %s\n' "${csq:-no reading}"
+    fi
+    [ -n "$cell" ] && printf 'cell         %s  (tracking area %s)\n' "$cell" "$tac"
+    ip -4 -br addr show "$IFACE" 2>/dev/null | awk '{printf "interface    %s %s\n", $1, $3}'
+}
+
+status() {
+    tty_setup
+    at 'AT+COPS?'; at 'AT+CSQ'; at 'AT+CEREG?'; at 'AT+CGACT?'
+    ip -br addr show "$IFACE"
+}
+
+case "${1:-status}" in
+    up) up "${2:-}" ;;
+    radio-on)
+        modem_stack || exit 3
+        tty_setup
+        mark radio-warmup-enter
+        radio_on
+        at 'AT+CAVIMS=1' 5 >/dev/null || true
+        mark radio-warmup-done
+        ;;
+    signal) signal ;;
+    at) [ -n "${2:-}" ] || { echo "usage: $0 at \"AT+COMMAND\"" >&2; exit 2; }
+        tty_setup; at "$2" "${3:-6}" ;;
+    down) down ;;
+    status) status ;;
+    sim-reset) sim_reset ;;
+    watch) watch ;;
+    *) echo "usage: $0 up [APN] | radio-on | down | status | signal | at \"CMD\" | sim-reset | watch" >&2; exit 2 ;;
+esac
